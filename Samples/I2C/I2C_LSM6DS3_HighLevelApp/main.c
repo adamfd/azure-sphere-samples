@@ -308,7 +308,7 @@ static ExitCode InitPeripheralsAndHandlers(void)
         return ExitCode_Init_AccelTimer;
     }
 
-    i2cFd = I2CMaster_Open(SAMPLE_LSM6DS3_I2C);
+    i2cFd = I2CMaster_Open(MT3620_RDB_HEADER2_ISU0_I2C);
     if (i2cFd == -1) {
         Log_Debug("ERROR: I2CMaster_Open: errno=%d (%s)\n", errno, strerror(errno));
         return ExitCode_Init_OpenMaster;
@@ -320,7 +320,7 @@ static ExitCode InitPeripheralsAndHandlers(void)
         return ExitCode_Init_SetBusSpeed;
     }
 
-    result = I2CMaster_SetTimeout(i2cFd, 100);
+    result = I2CMaster_SetTimeout(i2cFd, 5000);
     if (result != 0) {
         Log_Debug("ERROR: I2CMaster_SetTimeout: errno=%d (%s)\n", errno, strerror(errno));
         return ExitCode_Init_SetTimeout;

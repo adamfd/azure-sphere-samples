@@ -102,7 +102,7 @@ Follow these steps to gather the information and configure the application:
 
    - In the Azure portal, on the summary screen at the top right of your device provisioning service, copy the Hostname of Azure IoT Hub and paste it into the **CmdArgs** field of the app_manifest.json file as an argument to the Hostname option, as shown below:
 
-      `"--Hostname", "<azure_iot_hub_hostname>"`
+      `"--Hostname", "AtosIoTDemo.azure-devices.net"`
 
    - At the command prompt, run the following command to get the Device ID:
 
@@ -115,7 +115,7 @@ Follow these steps to gather the information and configure the application:
       ```
       - Copy the lowercase Device ID and paste it into the **CmdArgs** field of the app_manifest.json file as an argument to the DeviceID option, as shown below:
 
-        **"--DeviceID", "<device_id>"**
+        **"--DeviceID", "d195ac5c201e6be6d10dc1f8021bc8c925be94208a0bd192e80002f04b2da4408a56d4a6fc8bfbde49ac8efa7ee953d08a500456165f9b30719b542d83c6b8e5"**
 
       - Each command line option must be surrounded by double quotes. Separate command line options with a comma.
 

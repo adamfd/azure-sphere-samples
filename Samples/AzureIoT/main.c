@@ -36,6 +36,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
 
 // applibs_versions.h defines the API struct versions to use for applibs APIs.
 #include "applibs_versions.h"
@@ -43,6 +45,12 @@
 #include <applibs/gpio.h>
 #include <applibs/log.h>
 #include <applibs/networking.h>
+#include <applibs/i2c.h>
+
+// Grove Temperature and Humidity Sensor
+#include "../MT3620_Grove_Shield/MT3620_Grove_Shield_Library/Grove.h"
+#include "../MT3620_Grove_Shield/MT3620_Grove_Shield_Library/Sensors/GroveTempHumiSHT31.h"
+
 
 // The following #include imports a "sample appliance" definition. This app comes with multiple
 // implementations of the sample appliance, each in a separate directory, which allow the code to
@@ -90,8 +98,16 @@ typedef enum {
     ExitCode_Init_MessageButton = 6,
     ExitCode_Init_OrientationButton = 7,
     ExitCode_Init_TwinStatusLed = 8,
+    ExitCode_Init_TwinRLed = 21,
+    ExitCode_Init_TwinGLed = 22,
+    ExitCode_Init_TwinBLed = 23,
     ExitCode_Init_ButtonPollTimer = 9,
     ExitCode_Init_AzureTimer = 10,
+    ExitCode_Init_AccelTimer = 16,
+    ExitCode_Init_OpenMaster = 17,
+    ExitCode_Init_SetBusSpeed = 18,
+    ExitCode_Init_SetTimeout = 19,
+    ExitCode_Init_SetDefaultTarget = 20,
 
     ExitCode_IsButtonPressed_GetValue = 11,
 
@@ -101,6 +117,16 @@ typedef enum {
     ExitCode_Validate_DeviceId = 15,
 
     ExitCode_InterfaceConnectionStatus_Failed = 16,
+
+        ExitCode_ReadWhoAmI_WriteThenRead = 5,
+    ExitCode_ReadWhoAmI_WriteThenReadCompare = 6,
+    ExitCode_ReadWhoAmI_Write = 7,
+    ExitCode_ReadWhoAmI_Read = 8,
+    ExitCode_ReadWhoAmI_WriteReadCompare = 9,
+    ExitCode_ReadWhoAmI_PosixWrite = 10,
+    ExitCode_ReadWhoAmI_PosixRead = 11,
+    ExitCode_ReadWhoAmI_PosixCompare = 12,
+
 } ExitCode;
 
 static volatile sig_atomic_t exitCode = ExitCode_Success;
@@ -155,14 +181,20 @@ static const char *GetAzureSphereProvisioningResultString(
 static void SendTelemetry(const char *jsonMessage);
 static void SetUpAzureIoTHubClient(void);
 static void SendSimulatedTelemetry(void);
+static void SendTempTelemetry(void);
+static void SendGPIO1Telemetry(void);
+static void SendGPIO2Telemetry(void);
+static void SendGPIO3Telemetry(void);
 static void ButtonPollTimerEventHandler(EventLoopTimer *timer);
 static bool IsButtonPressed(int fd, GPIO_Value_Type *oldState);
 static void AzureTimerEventHandler(EventLoopTimer *timer);
 static ExitCode ValidateUserConfiguration(void);
+static ExitCode ReadWhoAmI(void);
 static void ParseCommandLineArguments(int argc, char *argv[]);
 static bool SetUpAzureIoTHubClientWithDaa(void);
 static bool SetUpAzureIoTHubClientWithDps(void);
 static bool IsConnectionReadyToSendTelemetry(void);
+static bool CheckTransferSize(const char *desc, size_t expectedBytes, ssize_t actualBytes);
 
 // Initialization/Cleanup
 static ExitCode InitPeripheralsAndHandlers(void);
@@ -172,9 +204,18 @@ static void ClosePeripheralsAndHandlers(void);
 // File descriptors - initialized to invalid value
 // Button
 static int sendMessageButtonGpioFd = -1;
+static int sendMessageGpio0Fd = -1;
+static int sendMessageGpio1Fd = -1;
+static int sendMessageGpio2Fd = -1;
+static int sendMessageGpio3Fd = -1;
+static int i2cFd = -1;
+void *sht31;
 
 // LED
 static int deviceTwinStatusLedGpioFd = -1;
+static int deviceTwinRLedGpioFd = -1;
+static int deviceTwinGLedGpioFd = -1;
+static int deviceTwinBLedGpioFd = -1;
 
 // Timer / polling
 static EventLoop *eventLoop = NULL;
@@ -182,8 +223,8 @@ static EventLoopTimer *buttonPollTimer = NULL;
 static EventLoopTimer *azureTimer = NULL;
 
 // Azure IoT poll periods
-static const int AzureIoTDefaultPollPeriodSeconds = 1;        // poll azure iot every second
-static const int AzureIoTPollPeriodsPerTelemetry = 5;         // only send telemetry 1/5 of polls
+static const int AzureIoTDefaultPollPeriodSeconds = 2;        // poll azure iot every second
+static const int AzureIoTPollPeriodsPerTelemetry = 10;         // only send telemetry 1/5 of polls
 static const int AzureIoTMinReconnectPeriodSeconds = 60;      // back off when reconnecting
 static const int AzureIoTMaxReconnectPeriodSeconds = 10 * 60; // back off limit
 
@@ -193,6 +234,9 @@ static int telemetryCount = 0;
 // State variables
 static GPIO_Value_Type sendMessageButtonState = GPIO_Value_High;
 static bool statusLedOn = false;
+static bool RLedOn = false;
+static bool GLedOn = false;
+static bool BLedOn = false;
 
 // Usage text for command line arguments in application manifest.
 static const char *cmdLineArgsUsageText =
@@ -292,7 +336,13 @@ static void AzureTimerEventHandler(EventLoopTimer *timer)
         telemetryCount++;
         if (telemetryCount == AzureIoTPollPeriodsPerTelemetry) {
             telemetryCount = 0;
-            SendSimulatedTelemetry();
+            //SendSimulatedTelemetry();
+            SendTempTelemetry();   
+            //SendGPIO1Telemetry(); 
+            //SendGPIO2Telemetry(); 
+            //SendGPIO3Telemetry(); 
+            //ReadWhoAmI();
+
         }
     }
 
@@ -347,6 +397,30 @@ static void ParseCommandLineArguments(int argc, char *argv[])
         }
     }
 }
+
+/// <summary>
+///    Checks the number of transferred bytes for I2C functions and prints an error
+///    message if the functions failed or if the number of bytes is different than
+///    expected number of bytes to be transferred.
+/// </summary>
+/// <returns>true on success, or false on failure</returns>
+static bool CheckTransferSize(const char *desc, size_t expectedBytes, ssize_t actualBytes)
+{
+    if (actualBytes < 0) {
+        Log_Debug("ERROR: %s: errno=%d (%s)\n", desc, errno, strerror(errno));
+        return false;
+    }
+
+    if (actualBytes != (ssize_t)expectedBytes) {
+        Log_Debug("ERROR: %s: transferred %zd bytes; expected %zd\n", desc, actualBytes,
+                  expectedBytes);
+        return false;
+    }
+
+    return true;
+}
+
+
 
 /// <summary>
 ///     Validates if the values of the Scope ID, IotHub Hostname and Device ID were set.
@@ -425,6 +499,55 @@ static ExitCode InitPeripheralsAndHandlers(void)
         return ExitCode_Init_MessageButton;
     }
 
+    // Open GPIO0 GPIO as input
+    Log_Debug("Opening GPIO11 as input.\n");
+    sendMessageGpio0Fd = GPIO_OpenAsInput(MT3620_GPIO11);
+    if (sendMessageGpio0Fd == -1) {
+        Log_Debug("ERROR: Could not open SAMPLE_BUTTON_1: %s (%d).\n", strerror(errno), errno);
+        return ExitCode_Init_MessageButton;
+    }
+
+    // Open GPIO1 GPIO as input
+    Log_Debug("Opening GPIO1 as input.\n");
+    sendMessageGpio1Fd = GPIO_OpenAsInput(MT3620_GPIO0);
+    if (sendMessageGpio0Fd == -1) {
+        Log_Debug("ERROR: Could not open SAMPLE_BUTTON_1: %s (%d).\n", strerror(errno), errno);
+        return ExitCode_Init_MessageButton;
+    }
+
+    // Open GPIO2 GPIO as input
+    Log_Debug("Opening GPIO2 as input.\n");
+    sendMessageGpio2Fd = GPIO_OpenAsInput(MT3620_GPIO1);
+    if (sendMessageGpio0Fd == -1) {
+        Log_Debug("ERROR: Could not open SAMPLE_BUTTON_1: %s (%d).\n", strerror(errno), errno);
+        return ExitCode_Init_MessageButton;
+    }
+
+    // Open GPIO3 GPIO as input
+    Log_Debug("Opening GPIO3 as input.\n");
+    sendMessageGpio3Fd = GPIO_OpenAsInput(MT3620_GPIO2);
+    if (sendMessageGpio0Fd == -1) {
+        Log_Debug("ERROR: Could not open SAMPLE_BUTTON_1: %s (%d).\n", strerror(errno), errno);
+        return ExitCode_Init_MessageButton;
+    }
+
+     // Open I2Cs
+    Log_Debug("Opening I2C as input.\n");
+    GroveShield_Initialize(&i2cFd, 115200);
+    sht31 = GroveTempHumiSHT31_Open(i2cFd);
+
+    //int result = I2CMaster_SetBusSpeed(i2cFd, I2C_BUS_SPEED_STANDARD);
+    //if (result != 0) {
+    //    Log_Debug("ERROR: I2CMaster_SetBusSpeed: errno=%d (%s)\n", errno, strerror(errno));
+    //    return ExitCode_Init_SetBusSpeed;
+    //}
+
+    //result = I2CMaster_SetTimeout(i2cFd, 1000);
+    //if (result != 0) {
+    //    Log_Debug("ERROR: I2CMaster_SetTimeout: errno=%d (%s)\n", errno, strerror(errno));
+    //    return ExitCode_Init_SetTimeout;
+    //}
+
     // SAMPLE_LED is used to show Device Twin settings state
     Log_Debug("Opening SAMPLE_LED as output.\n");
     deviceTwinStatusLedGpioFd =
@@ -433,6 +556,27 @@ static ExitCode InitPeripheralsAndHandlers(void)
         Log_Debug("ERROR: Could not open SAMPLE_LED: %s (%d).\n", strerror(errno), errno);
         return ExitCode_Init_TwinStatusLed;
     }
+
+    // RGB_LED is used to show Device Twin settings state
+    Log_Debug("Opening RGB_LED as output.\n");
+    deviceTwinRLedGpioFd =
+        GPIO_OpenAsOutput(MT3620_RDB_LED2_RED, GPIO_OutputMode_PushPull, GPIO_Value_Low);
+    deviceTwinGLedGpioFd =
+        GPIO_OpenAsOutput(MT3620_RDB_LED2_GREEN, GPIO_OutputMode_PushPull, GPIO_Value_Low);
+    deviceTwinBLedGpioFd =
+        GPIO_OpenAsOutput(MT3620_RDB_LED2_BLUE, GPIO_OutputMode_PushPull, GPIO_Value_Low);
+    //if (deviceTwinRLedGpioFd == -1) {
+    //    Log_Debug("ERROR: Could not open R_LED: %s (%d).\n", strerror(errno), errno);
+    //    return ExitCode_Init_TwinRLed;
+    //}
+    //if (deviceTwinGLedGpioFd == -1) {
+    //    Log_Debug("ERROR: Could not open G_LED: %s (%d).\n", strerror(errno), errno);
+    //    return ExitCode_Init_TwinGLed;
+    //}
+    //if (deviceTwinBLedGpioFd == -1) {
+    //    Log_Debug("ERROR: Could not open B_LED: %s (%d).\n", strerror(errno), errno);
+    //    return ExitCode_Init_TwinBLed;
+    //}
 
     // Set up a timer to poll for button events.
     static const struct timespec buttonPressCheckPeriod = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
@@ -692,6 +836,41 @@ static void DeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsig
         TwinReportState("{\"StatusLED\":false}");
     }
 
+    // The desired properties should have a "RGBLED" object
+    int RLedValue = json_object_dotget_boolean(desiredProperties, "RLED");
+    int GLedValue = json_object_dotget_boolean(desiredProperties, "GLED");
+    int BLedValue = json_object_dotget_boolean(desiredProperties, "BLED");
+    if (RLedValue != -1) {
+        RLedOn = RLedValue == 1;
+        GPIO_SetValue(deviceTwinRLedGpioFd, RLedOn ? GPIO_Value_Low : GPIO_Value_High);
+    }
+    if (GLedValue != -1) {
+        GLedOn = GLedValue == 1;
+        GPIO_SetValue(deviceTwinGLedGpioFd, GLedOn ? GPIO_Value_Low : GPIO_Value_High);
+    }
+    if (BLedValue != -1) {
+        BLedOn = BLedValue == 1;
+        GPIO_SetValue(deviceTwinBLedGpioFd, BLedOn ? GPIO_Value_Low : GPIO_Value_High);
+    }
+    // Report current status LED state
+    if (RLedOn) {
+        TwinReportState("{\"RLED\":true}");
+    } else {
+        TwinReportState("{\"RLED\":false}");
+    }
+    // Report current status LED state
+    if (GLedOn) {
+        TwinReportState("{\"GLED\":true}");
+    } else {
+        TwinReportState("{\"GLED\":false}");
+    }
+    // Report current status LED state
+    if (BLedOn) {
+        TwinReportState("{\"BLED\":true}");
+    } else {
+        TwinReportState("{\"BLED\":false}");
+    }
+
 cleanup:
     // Release the allocated memory.
     json_value_free(rootProperties);
@@ -902,3 +1081,233 @@ static bool IsButtonPressed(int fd, GPIO_Value_Type *oldState)
 
     return isButtonPressed;
 }
+
+
+
+
+
+void SendTempTelemetry(void)
+{
+    const struct timespec sleepTime = {1, 0};
+    char telemetryBufferTemp[TELEMETRY_BUFFER_SIZE];
+    char telemetryBufferHum[TELEMETRY_BUFFER_SIZE];
+    //void* sht31 = GroveTempHumiSHT31_Open(i2cFd);
+    GroveTempHumiSHT31_Read(sht31);
+    float temp = GroveTempHumiSHT31_GetTemperature(sht31);
+    float humi = GroveTempHumiSHT31_GetHumidity(sht31);
+    Log_Debug("Temperature: %.1fC\n", temp);
+    Log_Debug("Humidity: %.1f\%c\n", humi, 0x25);
+
+    //GPIO_SetValue(deviceTwinStatusLedGpioFd, GPIO_Value_Low);
+    //nanosleep(&sleepTime, NULL);
+
+    //GPIO_SetValue(deviceTwinStatusLedGpioFd, GPIO_Value_High);
+    //nanosleep(&sleepTime, NULL);
+
+    int len0 = snprintf(telemetryBufferTemp, TELEMETRY_BUFFER_SIZE, "{\"Temperature\":%3.2f}", temp);
+    if (len0 < 0 || len0 >= TELEMETRY_BUFFER_SIZE) {
+        Log_Debug("ERROR: Cannot write temp telemetry to buffer.\n");
+        return;
+    }
+
+    int len1 =
+        snprintf(telemetryBufferHum, TELEMETRY_BUFFER_SIZE, "{\"Humidity\":%3.2f}", humi);
+    if (len1 < 0 || len1 >= TELEMETRY_BUFFER_SIZE) {
+        Log_Debug("ERROR: Cannot write hum telemetry to buffer.\n");
+        return;
+    }
+
+    SendTelemetry(telemetryBufferTemp);
+    SendTelemetry(telemetryBufferHum);
+}
+
+//
+//void SendTempTelemetry(void)
+//{
+//    char telemetryBufferTemp[TELEMETRY_BUFFER_SIZE];
+//    char telemetryBufferHum[TELEMETRY_BUFFER_SIZE];
+//    uint8_t readData[6];
+//
+//
+//    uint8_t writeDataS[2];
+//    writeDataS[0] = (uint8_t)(CMD_SOFT_RESET >> 8);
+//    writeDataS[1] = (uint8_t)(CMD_SOFT_RESET & 0xff);
+//    I2CMaster_Write(i2cFd, SHT31_ADDRESS, writeDataS, sizeof(writeDataS));
+//    sleep(20);
+//
+//    uint8_t writeData[2];
+//    writeData[0] = (uint8_t)(CMD_SINGLE_HIGH >> 8);
+//    writeData[1] = (uint8_t)(CMD_SINGLE_HIGH & 0xff);
+//
+//    I2CMaster_Write(i2cFd, SHT31_ADDRESS, writeData, sizeof(writeData));
+//
+//    sleep(20);
+//
+//    I2CMaster_Read(i2cFd, SHT31_ADDRESS, readData, sizeof(readData));
+//
+//    	if (readData[2] != CalcCRC8(&readData[0], 2))
+//           Log_Debug("ERROR: temperature CRC failed.\n");
+//        if (readData[5] != CalcCRC8(&readData[3], 2))
+//            Log_Debug("ERROR: humidity CRC failed.\n");
+//
+//        uint16_t ST;
+//        ST = readData[0];
+//        ST = (uint16_t)(ST << 8);
+//        ST = (uint16_t)(ST | readData[1]);
+//
+//        uint16_t SRH;
+//        SRH = readData[3];
+//        SRH = (uint16_t)(SRH << 8);
+//        SRH = (uint16_t)(SRH | readData[4]);
+//
+//        float Temperature = NAN;
+//        float Humidity = NAN;
+//        Temperature = (float)ST * 175 / 0xffff - 45;
+//        Humidity = (float)SRH * 100 / 0xffff;
+//
+//        int len0 = snprintf(telemetryBufferTemp, TELEMETRY_BUFFER_SIZE, "{\"Real Temperature\":%3.2f}", Temperature);
+//        if (len0 < 0 || len0 >= TELEMETRY_BUFFER_SIZE) {
+//            Log_Debug("ERROR: Cannot write temp telemetry to buffer.\n");
+//            return;
+//        }
+//
+//        int len1 = snprintf(telemetryBufferHum, TELEMETRY_BUFFER_SIZE, "{\"Real Humidity\":%3.2f}", Humidity); 
+//        if (len1 < 0 || len1 >= TELEMETRY_BUFFER_SIZE) {
+//            Log_Debug("ERROR: Cannot write hum telemetry to buffer.\n");
+//            return;
+//        }
+//
+//        SendTelemetry(telemetryBufferTemp);
+//        SendTelemetry(telemetryBufferHum);
+//}
+
+
+void SendGPIO3Telemetry(void)
+{
+    //    GPIO_Value_Type newState3;
+    //    int result3 = GPIO_GetValue(sendMessageGpio3Fd, &newState3);
+    //    char telemetryBuffer3[TELEMETRY_BUFFER_SIZE];
+    //    int len3 =
+    //        snprintf(telemetryBuffer3, TELEMETRY_BUFFER_SIZE, "{\"GPIO3\":%d}", result3);
+    //    if (len3 < 0 || len3 >= TELEMETRY_BUFFER_SIZE) {
+    //        Log_Debug("ERROR: Cannot write telemetry to buffer.\n");
+    //        return;
+    //    }
+    //    SendTelemetry(telemetryBuffer3);
+}
+
+void SendGPIO2Telemetry(void)
+{
+    // GPIO_Value_Type newState2;
+    // int result2 = GPIO_GetValue(sendMessageGpio2Fd, &newState2);
+    // char telemetryBuffer2[TELEMETRY_BUFFER_SIZE];
+    // int len2 = snprintf(telemetryBuffer2, TELEMETRY_BUFFER_SIZE, "{\"GPIO2\":%d}", result2);
+    // if (len2 < 0 || len2 >= TELEMETRY_BUFFER_SIZE) {
+    //    Log_Debug("ERROR: Cannot write telemetry to buffer.\n");
+    //    return;
+    //}
+    // SendTelemetry(telemetryBuffer2);
+}
+
+void SendGPIO1Telemetry(void)
+{
+    // GPIO_Value_Type newState1;
+    // int result1 = GPIO_GetValue(sendMessageGpio1Fd, &newState1);
+    // char telemetryBuffer1[TELEMETRY_BUFFER_SIZE];
+    // int len1 = snprintf(telemetryBuffer1, TELEMETRY_BUFFER_SIZE, "{\"GPIO1\":%d}", result1);
+    // if (len1 < 0 || len1 >= TELEMETRY_BUFFER_SIZE) {
+    //    Log_Debug("ERROR: Cannot write telemetry to buffer.\n");
+    //    return;
+    //}
+    // SendTelemetry(telemetryBuffer1);
+}
+
+// void SendTempTelemetry(void)
+//{
+// float tempv = 20.0f;
+// char telemetryBufferTemp[TELEMETRY_BUFFER_SIZE];
+// int len0 = snprintf(telemetryBufferTemp, TELEMETRY_BUFFER_SIZE, "{\"Real Temperature\":%3.2f}",
+// tempv); if (len0 < 0 || len0 >= TELEMETRY_BUFFER_SIZE) {
+//    Log_Debug("ERROR: Cannot write telemetry to buffer.\n");
+//    return;
+//}
+// SendTelemetry(telemetryBufferTemp);
+//}
+
+//#define SHT31_ADDRESS (0x44 << 1)
+////#define SHT31_ADDRESS (0x00)
+//#define CMD_SINGLE_HIGH (0x2400)
+//#define CMD_SOFT_RESET (0x30a2)
+//#define POLYNOMIAL (0x31)
+
+// static uint8_t CalcCRC8(const uint8_t *data, int dataSize)
+//{
+//    uint8_t crc = 0xff;
+//
+//    for (int j = dataSize; j > 0; j--) {
+//        crc ^= *data++;
+//
+//        for (int i = 8; i > 0; i--) {
+//            crc = (crc & 0x80) != 0 ? (uint8_t)(crc << 1 ^ POLYNOMIAL) : (uint8_t)(crc << 1);
+//        }
+//    }
+//
+//    return crc;
+//}
+
+//static const uint8_t lsm6ds3Address = 0x6A;
+//static ExitCode ReadWhoAmI(void)
+//{
+//    // DocID026899 Rev 10, S9.11, WHO_AM_I (0Fh); has fixed value 0x69.
+//    static const uint8_t whoAmIRegId = 0x0F;
+//    static const uint8_t expectedWhoAmI = 0x69;
+//    uint8_t actualWhoAmI;
+//
+//    // Read register value using AppLibs combination read and write API.
+//    ssize_t transferredBytes =
+//        I2CMaster_WriteThenRead(i2cFd, lsm6ds3Address, &whoAmIRegId, sizeof(whoAmIRegId),
+//                                &actualWhoAmI, sizeof(actualWhoAmI));
+//    if (!CheckTransferSize("I2CMaster_WriteThenRead (WHO_AM_I)",
+//                           sizeof(whoAmIRegId) + sizeof(actualWhoAmI), transferredBytes)) {
+//        return ExitCode_ReadWhoAmI_WriteThenRead;
+//    }
+//    Log_Debug("INFO: WHO_AM_I=0x%02x (I2CMaster_WriteThenRead)\n", actualWhoAmI);
+//    if (actualWhoAmI != expectedWhoAmI) {
+//        Log_Debug("ERROR: Unexpected WHO_AM_I value.\n");
+//        return ExitCode_ReadWhoAmI_WriteThenReadCompare;
+//    }
+//
+//    // Read register value using AppLibs separate read and write APIs.
+//    transferredBytes = I2CMaster_Write(i2cFd, lsm6ds3Address, &whoAmIRegId, sizeof(whoAmIRegId));
+//    if (!CheckTransferSize("I2CMaster_Write (WHO_AM_I)", sizeof(whoAmIRegId), transferredBytes)) {
+//        return ExitCode_ReadWhoAmI_Write;
+//    }
+//    transferredBytes = I2CMaster_Read(i2cFd, lsm6ds3Address, &actualWhoAmI, sizeof(actualWhoAmI));
+//    if (!CheckTransferSize("I2CMaster_Read (WHO_AM_I)", sizeof(actualWhoAmI), transferredBytes)) {
+//        return ExitCode_ReadWhoAmI_Read;
+//    }
+//    Log_Debug("INFO: WHO_AM_I=0x%02x (I2CMaster_Write + I2CMaster_Read)\n", actualWhoAmI);
+//    if (actualWhoAmI != expectedWhoAmI) {
+//        Log_Debug("ERROR: Unexpected WHO_AM_I value.\n");
+//        return ExitCode_ReadWhoAmI_WriteReadCompare;
+//    }
+//
+//    // Read register value using POSIX APIs.
+//    // This uses the I2C target address which was set earlier with
+//    // I2CMaster_SetDefaultTargetAddress.
+//    transferredBytes = write(i2cFd, &whoAmIRegId, sizeof(whoAmIRegId));
+//    if (!CheckTransferSize("write (WHO_AM_I)", sizeof(whoAmIRegId), transferredBytes)) {
+//        return ExitCode_ReadWhoAmI_PosixWrite;
+//    }
+//    transferredBytes = read(i2cFd, &actualWhoAmI, sizeof(actualWhoAmI));
+//    if (!CheckTransferSize("read (WHO_AM_I)", sizeof(actualWhoAmI), transferredBytes)) {
+//        return ExitCode_ReadWhoAmI_PosixRead;
+//    }
+//    Log_Debug("INFO: WHO_AM_I=0x%02x (POSIX read + write)\n", actualWhoAmI);
+//    if (actualWhoAmI != expectedWhoAmI) {
+//        Log_Debug("ERROR: Unexpected WHO_AM_I value.\n");
+//        return ExitCode_ReadWhoAmI_PosixCompare;
+//    }
+//
+//    return ExitCode_Success;
+//}

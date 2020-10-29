@@ -5,7 +5,7 @@
   "EntryPoint": "/bin/app",
   "CmdArgs": [],
   "Capabilities": {
-    "I2cMaster": [ "$SAMPLE_LSM6DS3_I2C" ]
+    "I2cMaster": [ "$MT3620_RDB_HEADER2_ISU0_I2C" ]
   },
   "ApplicationType": "Default"
 }

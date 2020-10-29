@@ -26,3 +26,5 @@
 /// It indicates which version of the SPI data structures the application uses.
 /// </summary>
 #define SPI_STRUCTS_VERSION 1
+
+/// #define I2C_STRUCTS_VERSION 1
